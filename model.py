@@ -74,14 +74,10 @@ class GCL4SR(nn.Module):
         self.lam2 = lam2
 
         if torch.cuda.is_available():
-            print("Using GPU")
             self.device = torch.device('cuda')
-        elif torch.backends.mps.is_available():
-            print("Using Apple Silicon GPU")
-            self.device = torch.device('mps')
         else:
-            print("Using CPU")
             self.device = torch.device('cpu')
+        
         self.global_graph = global_graph.to(self.device)
         self.global_gnn = GNN_Encoder(hidden_size, sample_size, gnn_dropout_prob=0.5)
 
