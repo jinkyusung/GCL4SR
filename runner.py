@@ -7,7 +7,7 @@ import argparse
 import os
 import pickle
 
-from GCL4SR.datasets.build_witg import build_WITG_from_trainset
+from build_witg import build_WITG_from_trainset
 from dataset import GCL4SRData
 from trainer import GCL4SR_Train
 from model import GCL4SR
@@ -91,10 +91,10 @@ def main():
     checkpoint = args_str + '.pt'
     args.checkpoint_path = os.path.join(args.output_dir, checkpoint)
     try:
-        global_graph = torch.load(args.data_dir + 'witg.pt')
+        global_graph = torch.load(args.data_dir + 'witg.pt', weights_only=False)
     except:
         build_WITG_from_trainset(datapath=args.data_dir)
-        global_graph = torch.load(args.data_dir + 'witg.pt')
+        global_graph = torch.load(args.data_dir + 'witg.pt', weights_only=False)
     model = GCL4SR(args=args, global_graph=global_graph)
 
     train_dataset = GCL4SRData(args, train_data)
