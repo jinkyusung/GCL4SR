@@ -1,41 +1,56 @@
-# -*- coding: utf-8 -*-
-import numpy as np
-import tqdm
+import math
 import torch
+import numpy as np
+from tqdm import tqdm
 
-from utils import recall_at_k, ndcg_k, get_metric
+
+
+def recall_at_k(actual, predicted, topk):
+    sum_recall = 0.0
+    num_users = len(predicted)
+    true_users = 0
+    for i in range(num_users):
+        act_set = set(actual[i])
+        pred_set = set(predicted[i][:topk])
+        if len(act_set) != 0:
+            sum_recall += len(act_set & pred_set) / float(len(act_set))
+            true_users += 1
+    return sum_recall / true_users
+
+
+
+def ndcg_k(actual, predicted, topk):
+    res = 0
+    for user_id in range(len(actual)):
+        k = min(topk, len(actual[user_id]))
+        idcg = idcg_k(k)
+        dcg_k = sum([int(predicted[user_id][j] in set(actual[user_id])) / math.log(j+2, 2) for j in range(topk)])
+        res += dcg_k / idcg
+    return res / float(len(actual))
+
+
+
+def idcg_k(k):
+    res = sum([1.0/math.log(i+2, 2) for i in range(k)])
+    if not res:
+        return 1.0
+    else:
+        return res
+
 
 
 class Trainer:
-    def __init__(self, model, args):
-
-        self.args = args
+    def __init__(self, model):
         self.model = model
         if self.model.cuda_condition:
             self.model.to(self.model.device)
 
-    def get_sample_scores(self, epoch, pred_list):
-        pred_list = (-pred_list).argsort().argsort()[:, 0]
-        HIT_1, NDCG_1, MRR = get_metric(pred_list, 1)
-        HIT_5, NDCG_5, MRR = get_metric(pred_list, 5)
-        HIT_10, NDCG_10, MRR = get_metric(pred_list, 10)
-        post_fix = {
-            "Epoch": epoch,
-            "HIT@1": '{:.4f}'.format(HIT_1), "NDCG@1": '{:.4f}'.format(NDCG_1),
-            "HIT@5": '{:.4f}'.format(HIT_5), "NDCG@5": '{:.4f}'.format(NDCG_5),
-            "HIT@10": '{:.4f}'.format(HIT_10), "NDCG@10": '{:.4f}'.format(NDCG_10),
-            "MRR": '{:.4f}'.format(MRR),
-        }
-        print(post_fix)
-        with open(self.args.log_file, 'a') as f:
-            f.write(str(post_fix) + '\n')
-        return [HIT_1, NDCG_1, HIT_5, NDCG_5, HIT_10, NDCG_10, MRR], str(post_fix)
-
-    def get_full_sort_score(self, epoch, answers, pred_list):
+    def get_scores(self, epoch, answers, pred_list):
         recall, ndcg = [], []
         for k in [5, 10, 15, 20]:
             recall.append(recall_at_k(answers, pred_list, k))
             ndcg.append(ndcg_k(answers, pred_list, k))
+        
         post_fix = {
             "Epoch": epoch,
             "HIT@5": '{:.4f}'.format(recall[0]), "NDCG@5": '{:.4f}'.format(ndcg[0]),
@@ -43,8 +58,6 @@ class Trainer:
             "HIT@20": '{:.4f}'.format(recall[3]), "NDCG@20": '{:.4f}'.format(ndcg[3])
         }
         print(post_fix)
-        with open(self.args.log_file, 'a') as f:
-            f.write(str(post_fix) + '\n')
         return [recall[0], ndcg[0], recall[1], ndcg[1], recall[3], ndcg[3]], str(post_fix)
 
     def save(self, file_name):
@@ -54,135 +67,73 @@ class Trainer:
     def load(self, file_name):
         self.model.load_state_dict(torch.load(file_name))
 
-    def predict_sample(self, seq_out, test_neg_sample):
-        # [batch 100 hidden_size]
-        test_item_emb = self.model.item_embeddings(test_neg_sample)
-        # [batch hidden_size]
-        test_logits = torch.bmm(test_item_emb, seq_out.unsqueeze(-1)).squeeze(-1)  # [B 100]
-        return test_logits
-
-    def predict_full(self, seq_out):
-        # [item_num hidden_size]
+    def predict(self, seq_out):
         test_item_emb = self.model.item_embeddings.weight
-        # [batch hidden_size ]
         rating_pred = torch.matmul(seq_out, test_item_emb.transpose(0, 1))
         return rating_pred
 
 
+
 class GCL4SR_Train(Trainer):
-    def __init__(self, model, args):
-        super(GCL4SR_Train, self).__init__(
-            model,
-            args
-        )
+    def __init__(self, model, optimizer, sample_size, hidden_size, train_matrix):
+        super(GCL4SR_Train, self).__init__(model)
+        self.optimizer = optimizer
+        self.sample_size = sample_size
+        self.hidden_size = hidden_size
+        self.train_matrix = train_matrix
 
     def train_stage(self, epoch, train_dataloader):
 
-        desc = f'n_sample-{self.args.sample_size}-' \
-               f'hidden_size-{self.args.hidden_size}'
-
-        train_data_iter = tqdm.tqdm(enumerate(train_dataloader),
-                                       desc=f"{self.args.model_name}-{self.args.data_name} Epoch:{epoch}",
-                                       total=len(train_dataloader),
-                                       bar_format="{l_bar}{r_bar}")
+        train_data_iter = tqdm(enumerate(train_dataloader), desc=f"Epoch {epoch}", total=len(train_dataloader))
 
         self.model.train()
-        joint_loss_avg = 0.0
-        main_loss_avg = 0.0
-        cl_loss_avg = 0.0
-        mmd_loss_avg = 0.0
 
-        for i, batch in train_data_iter:
-            # 0. batch_data will be sent into the device(GPU or CPU)
+        loss_sum = 0.0
+
+        for _, batch in train_data_iter:
             batch = tuple(t.to(self.model.device) for t in batch)
 
-            joint_loss, main_loss, cl_loss, mmd_loss = self.model.train_stage(batch)
+            loss = self.model.loss_fn(batch)
 
-            self.model.optimizer.zero_grad()
-            joint_loss.backward()
-            self.model.optimizer.step()
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
 
-            joint_loss_avg += joint_loss.item()
-            main_loss_avg += main_loss.item()
-            cl_loss_avg += cl_loss.item()
-            mmd_loss_avg += mmd_loss.item()
-        self.model.scheduler.step()
-        post_fix = {
-            "epoch": epoch,
-            "joint_loss_avg": '{:.4f}'.format(joint_loss_avg / len(train_data_iter)),
-            "main_loss_avg": '{:.4f}'.format(main_loss_avg / len(train_data_iter)),
-            "gcl_loss_avg": '{:.4f}'.format(cl_loss_avg / len(train_data_iter)),
-            "mmd_loss_avg": '{:.4f}'.format(mmd_loss_avg / len(train_data_iter)),
-        }
-        print(desc)
-        print(str(post_fix))
-        with open(self.args.log_file, 'a') as f:
-            f.write(str(desc) + '\n')
-            f.write(str(post_fix) + '\n')
+            loss_sum += loss.item()
 
-    def eval_stage(self, epoch, dataloader, full_sort=False, test=True):
+        loss_avg = loss_sum / len(train_data_iter)
+        print(f"loss_avg: {loss_avg:.4f}")
 
+    def eval_stage(self, epoch, dataloader, test=True):
         str_code = "test" if test else "eval"
-        rec_data_iter = tqdm.tqdm(enumerate(dataloader),
-                                  desc="Recommendation EP_%s:%d" % (str_code, epoch),
-                                  total=len(dataloader),
-                                  bar_format="{l_bar}{r_bar}")
+        rec_data_iter = tqdm(enumerate(dataloader), desc="Recommendation EP_%s:%d" % (str_code, epoch), total=len(dataloader))
+        
         self.model.eval()
-
         pred_list = None
+        answer_list = None
 
-        if full_sort:
-            answer_list = None
+        for i, batch in rec_data_iter:
+            batch = tuple(t.to(self.model.device) for t in batch)
+            user_ids = batch[0]
+            answers = batch[2]
+            recommend_output = self.model.eval_stage(batch)
+            answers = answers.view(-1, 1)
 
-            for i, batch in rec_data_iter:
-                # 0. batch_data will be sent into the device(GPU or cpu)
-                batch = tuple(t.to(self.model.device) for t in batch)
-                user_ids = batch[0]
-                answers = batch[2]
-                recommend_output = self.model.eval_stage(batch)
-                answers = answers.view(-1, 1)
+            rating_pred = self.predict(recommend_output)
 
-                # 推荐的结果
-                rating_pred = self.predict_full(recommend_output)
+            rating_pred = rating_pred.cpu().data.numpy().copy()
+            batch_user_index = user_ids.cpu().numpy()
+            rating_pred[self.train_matrix[batch_user_index].toarray() > 0] = 0
+            ind = np.argpartition(rating_pred, -20)[:, -20:]
+            arr_ind = rating_pred[np.arange(len(rating_pred))[:, None], ind]
+            arr_ind_argsort = np.argsort(arr_ind)[np.arange(len(rating_pred)), ::-1]
+            batch_pred_list = ind[np.arange(len(rating_pred))[:, None], arr_ind_argsort]
 
-                rating_pred = rating_pred.cpu().data.numpy().copy()
-                batch_user_index = user_ids.cpu().numpy()
-                rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
-                # reference: https://stackoverflow.com/a/23734295, https://stackoverflow.com/a/20104162
-                # argpartition 时间复杂度O(n)  argsort O(nlogn) 只会做
-                # 加负号"-"表示取大的值
-                ind = np.argpartition(rating_pred, -20)[:, -20:]
-                # 根据返回的下标 从对应维度分别取对应的值 得到每行topk的子表
-                arr_ind = rating_pred[np.arange(len(rating_pred))[:, None], ind]
-                # 对子表进行排序 得到从大到小的顺序
-                arr_ind_argsort = np.argsort(arr_ind)[np.arange(len(rating_pred)), ::-1]
-                # 再取一次 从ind中取回 原来的下标
-                batch_pred_list = ind[np.arange(len(rating_pred))[:, None], arr_ind_argsort]
-
-                if i == 0:
-                    pred_list = batch_pred_list
-                    answer_list = answers.cpu().data.numpy()
-                else:
-                    pred_list = np.append(pred_list, batch_pred_list, axis=0)
-                    answer_list = np.append(answer_list, answers.cpu().data.numpy(), axis=0)
-            return self.get_full_sort_score(epoch, answer_list, pred_list)
-
-        else:
-            for i, batch in rec_data_iter:
-                # 0. batch_data will be sent into the device(GPU or cpu)
-                batch = tuple(t.to(self.model.device) for t in batch)
-                user_ids, inputs, target_seq, target_neg, target_nxt, mask_node_sequence, pos_node, sample_negs = batch
-
-                recommend_output = self.model.eval_stage(batch)
-                test_neg_items = torch.cat((target_nxt.view(-1, 1), sample_negs), -1)
-                recommend_output = recommend_output[:, -1, :]
-
-                test_logits = self.predict_sample(recommend_output, test_neg_items)
-                test_logits = test_logits.cpu().detach().numpy().copy()
-                if i == 0:
-                    pred_list = test_logits
-                else:
-                    pred_list = np.append(pred_list, test_logits, axis=0)
-
-            return self.get_sample_scores(epoch, pred_list)
-
+            if i == 0:
+                pred_list = batch_pred_list
+                answer_list = answers.cpu().data.numpy()
+            else:
+                pred_list = np.append(pred_list, batch_pred_list, axis=0)
+                answer_list = np.append(answer_list, answers.cpu().data.numpy(), axis=0)
+                
+        return self.get_scores(epoch, answer_list, pred_list)
