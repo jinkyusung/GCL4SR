@@ -3,6 +3,7 @@ from torch.utils.data import Dataset
 
 
 
+
 class GCL4SRData(Dataset):
     def __init__(self, data, max_seq_length):
         self.max_len = max_seq_length
@@ -32,3 +33,5 @@ class GCL4SRData(Dataset):
 
     def __len__(self):
         return self.length
+
+

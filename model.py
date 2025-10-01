@@ -11,9 +11,10 @@ import numpy as np
 
 
 
-class GlobalGNN(Module):
+
+class GNN_Encoder(Module):
     def __init__(self, hidden_size, sample_size, gnn_dropout_prob):
-        super(GlobalGNN, self).__init__()
+        super(GNN_Encoder, self).__init__()
         self.hidden_size = hidden_size
         in_channels = hidden_channels = self.hidden_size
         self.num_layers = len(sample_size)
@@ -23,6 +24,7 @@ class GlobalGNN(Module):
         self.convs.append(SAGEConv(in_channels, hidden_channels, normalize=True))
         for i in range(self.num_layers - 1):
             self.convs.append(SAGEConv(hidden_channels, hidden_channels, normalize=True))
+
 
     def forward(self, x, adjs, attr):
         xs = []
@@ -55,6 +57,10 @@ class GlobalGNN(Module):
         return torch.cat(xs, 0)
 
 
+
+
+
+
 class GCL4SR(nn.Module):
     def __init__(self, user_num, item_num, hidden_size, max_seq_length, num_attention_heads, global_graph, num_hidden_layers, lam1, lam2, sample_size):
         super(GCL4SR, self).__init__()
@@ -67,10 +73,9 @@ class GCL4SR(nn.Module):
         self.lam1 = lam1
         self.lam2 = lam2
 
-        self.cuda_condition = torch.cuda.is_available()
-        self.device = torch.device('cuda') if self.cuda_condition else "cpu"
+        self.device = torch.device('cuda') if torch.cuda.is_available() else "cpu"
         self.global_graph = global_graph.to(self.device)
-        self.global_gnn = GlobalGNN(hidden_size, sample_size, gnn_dropout_prob=0.5)
+        self.global_gnn = GNN_Encoder(hidden_size, sample_size, gnn_dropout_prob=0.5)
 
         self.user_embeddings = nn.Embedding(user_num, hidden_size)
         self.item_embeddings = nn.Embedding(item_num, hidden_size, padding_idx=0)
@@ -124,60 +129,6 @@ class GCL4SR(nn.Module):
             if module.bias is not None:
                 constant_(module.bias.data, 0)
 
-    def guassian_kernel(self, source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
-        n_samples = int(source.size()[0]) + int(target.size()[0])
-        total = torch.cat([source, target], dim=0)
-        total0 = total.unsqueeze(0).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
-        total1 = total.unsqueeze(1).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
-        L2_distance = ((total0 - total1) ** 2).sum(2)
-        if fix_sigma:
-            bandwidth = fix_sigma
-        else:
-            bandwidth = torch.sum(L2_distance.data) / (n_samples ** 2 - n_samples)
-        bandwidth /= kernel_mul ** (kernel_num // 2)
-        bandwidth_list = [bandwidth * (kernel_mul ** i) for i in range(kernel_num)]
-        kernel_val = [torch.exp(-L2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list]
-        return sum(kernel_val)
-
-    def MMD_loss(self, source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
-        source = source.view(-1, self.max_seq_length)
-        target = target.view(-1, self.max_seq_length)
-        batch_size = int(source.size()[0])
-        loss_all = []
-        kernels = self.guassian_kernel(source, target, kernel_mul=kernel_mul, kernel_num=kernel_num,
-                                        fix_sigma=fix_sigma)
-        xx = kernels[:batch_size, :batch_size]
-        yy = kernels[batch_size:, batch_size:]
-        xy = kernels[:batch_size, batch_size:]
-        yx = kernels[batch_size:, :batch_size]
-        loss = torch.mean(xx + yy - xy - yx)
-        loss_all.append(loss)
-        return sum(loss_all) / len(loss_all)
-
-    def GCL_loss(self, hidden, hidden_norm=True, temperature=1.0):
-        batch_size = hidden.shape[0] // 2
-        LARGE_NUM = 1e9
-        if hidden_norm:
-            hidden = torch.nn.functional.normalize(hidden, p=2, dim=-1)
-        hidden_list = torch.split(hidden, batch_size, dim=0)
-        hidden1, hidden2 = hidden_list[0], hidden_list[1]
-
-        hidden1_large = hidden1
-        hidden2_large = hidden2
-        labels = torch.from_numpy(np.arange(batch_size)).to(hidden.device)
-        masks = torch.nn.functional.one_hot(torch.from_numpy(np.arange(batch_size)).to(hidden.device), batch_size)
-
-        logits_aa = torch.matmul(hidden1, hidden1_large.transpose(1, 0)) / temperature
-        logits_aa = logits_aa - masks * LARGE_NUM
-        logits_bb = torch.matmul(hidden2, hidden2_large.transpose(1, 0)) / temperature
-        logits_bb = logits_bb - masks * LARGE_NUM
-        logits_ab = torch.matmul(hidden1, hidden2_large.transpose(1, 0)) / temperature
-        logits_ba = torch.matmul(hidden2, hidden1_large.transpose(1, 0)) / temperature
-
-        loss_a = torch.nn.functional.cross_entropy(torch.cat([logits_ab, logits_aa], 1), labels)
-        loss_b = torch.nn.functional.cross_entropy(torch.cat([logits_ba, logits_bb], 1), labels)
-        loss = (loss_a + loss_b)
-        return loss
 
     def gnn_encode(self, items):
         subgraph_loaders = NeighborSampler(self.global_graph.edge_index, node_idx=items, sizes=self.sample_size,
@@ -196,6 +147,7 @@ class GCL4SR(nn.Module):
         g_hidden = self.global_gnn(s_nodes, g_adjs, attr)
         return g_hidden
 
+
     def final_att_net(self, seq_mask, hidden):
         batch_size = hidden.shape[0]
         lens = hidden.shape[1]
@@ -211,12 +163,13 @@ class GCL4SR(nn.Module):
         output = torch.sum(att_score_masked * hidden, 1)
         return output
 
+
     def generate_square_subsequent_mask(self, sz: int) -> Tensor:
         mask = torch.triu(torch.ones(sz, sz, dtype=torch.bool), diagonal=1)
         return mask
 
-    def forward(self, data):
 
+    def forward(self, data):
         user_ids = data[0]
         inputs = data[1]
 
@@ -256,7 +209,14 @@ class GCL4SR(nn.Module):
 
         return sequence_output, hidden, user_seq_a, user_seq_b, (seq_hidden_global_a, seq_hidden_global_b), seq_mask
 
-    def loss_fn(self, data):
+
+    def eval_stage(self, data):
+        _, hidden, _, _, _, seq_mask = self.forward(data)
+        hidden = self.final_att_net(seq_mask, hidden)
+        return hidden
+
+
+    def calculate_loss(self, data):
         targets = data[2]
         sequence_output, hidden, user_seq_a, user_seq_b, (seq_gnn_a, seq_gnn_b), seq_mask = self.forward(data)
         seq_out = self.final_att_net(seq_mask, hidden)
@@ -277,9 +237,62 @@ class GCL4SR(nn.Module):
         mmd_loss = self.MMD_loss(seq_hidden_local, user_seq_a) + self.MMD_loss(seq_hidden_local, user_seq_b)
 
         loss = main_loss + self.lam1 * gcl_loss + self.lam2 * mmd_loss
-        return loss
+        return loss, main_loss, gcl_loss, mmd_loss
+    
 
-    def eval_stage(self, data):
-        _, hidden, _, _, _, seq_mask = self.forward(data)
-        hidden = self.final_att_net(seq_mask, hidden)
-        return hidden
+    def GCL_loss(self, hidden, hidden_norm=True, temperature=1.0):
+        batch_size = hidden.shape[0] // 2
+        LARGE_NUM = 1e9
+        if hidden_norm:
+            hidden = torch.nn.functional.normalize(hidden, p=2, dim=-1)
+        hidden_list = torch.split(hidden, batch_size, dim=0)
+        hidden1, hidden2 = hidden_list[0], hidden_list[1]
+
+        hidden1_large = hidden1
+        hidden2_large = hidden2
+        labels = torch.from_numpy(np.arange(batch_size)).to(hidden.device)
+        masks = torch.nn.functional.one_hot(torch.from_numpy(np.arange(batch_size)).to(hidden.device), batch_size)
+
+        logits_aa = torch.matmul(hidden1, hidden1_large.transpose(1, 0)) / temperature
+        logits_aa = logits_aa - masks * LARGE_NUM
+        logits_bb = torch.matmul(hidden2, hidden2_large.transpose(1, 0)) / temperature
+        logits_bb = logits_bb - masks * LARGE_NUM
+        logits_ab = torch.matmul(hidden1, hidden2_large.transpose(1, 0)) / temperature
+        logits_ba = torch.matmul(hidden2, hidden1_large.transpose(1, 0)) / temperature
+
+        loss_a = torch.nn.functional.cross_entropy(torch.cat([logits_ab, logits_aa], 1), labels)
+        loss_b = torch.nn.functional.cross_entropy(torch.cat([logits_ba, logits_bb], 1), labels)
+        loss = (loss_a + loss_b)
+        return loss
+    
+
+    def guassian_kernel(self, source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
+        n_samples = int(source.size()[0]) + int(target.size()[0])
+        total = torch.cat([source, target], dim=0)
+        total0 = total.unsqueeze(0).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
+        total1 = total.unsqueeze(1).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
+        L2_distance = ((total0 - total1) ** 2).sum(2)
+        if fix_sigma:
+            bandwidth = fix_sigma
+        else:
+            bandwidth = torch.sum(L2_distance.data) / (n_samples ** 2 - n_samples)
+        bandwidth /= kernel_mul ** (kernel_num // 2)
+        bandwidth_list = [bandwidth * (kernel_mul ** i) for i in range(kernel_num)]
+        kernel_val = [torch.exp(-L2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list]
+        return sum(kernel_val)
+
+
+    def MMD_loss(self, source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
+        source = source.view(-1, self.max_seq_length)
+        target = target.view(-1, self.max_seq_length)
+        batch_size = int(source.size()[0])
+        loss_all = []
+        kernels = self.guassian_kernel(source, target, kernel_mul=kernel_mul, kernel_num=kernel_num, fix_sigma=fix_sigma)
+        xx = kernels[:batch_size, :batch_size]
+        yy = kernels[batch_size:, batch_size:]
+        xy = kernels[:batch_size, batch_size:]
+        yx = kernels[batch_size:, :batch_size]
+        loss = torch.mean(xx + yy - xy - yx)
+        loss_all.append(loss)
+        return sum(loss_all) / len(loss_all)
+

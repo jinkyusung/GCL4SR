@@ -3,6 +3,7 @@ from scipy.sparse import csr_matrix
 
 
 
+
 def generate_rating_matrix_train(user_seq, num_users, num_items):
     row = []
     col = []
@@ -22,6 +23,7 @@ def generate_rating_matrix_train(user_seq, num_users, num_items):
 
 
 
+
 def generate_rating_matrix_test(user_seq, num_users, num_items):
     row = []
     col = []
@@ -38,6 +40,7 @@ def generate_rating_matrix_test(user_seq, num_users, num_items):
     rating_matrix = csr_matrix((data, (row, col)), shape=(num_users, num_items))
 
     return rating_matrix
+
 
 
 
