@@ -115,7 +115,6 @@ def _calculate_idcg(k: int) -> float:
     Returns:
         float: IDCG@k 점수.
     """
-    # 순위(rank) 1부터 k까지의 할인된 점수를 모두 더함
     ideal_dcg = sum([1.0 / math.log2(rank + 1) for rank in range(1, k + 1)])
     return ideal_dcg
 

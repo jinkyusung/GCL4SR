@@ -274,33 +274,124 @@ class GCL4SR(nn.Module):
         return loss
     
 
+    # def MMD_loss(self, source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
+    #     source = source.view(-1, self.max_seq_length)
+    #     target = target.view(-1, self.max_seq_length)
+    #     batch_size = int(source.size()[0])
+    #     loss_all = []
+    #     kernels = self.gaussian_kernel(source, target, kernel_mul=kernel_mul, kernel_num=kernel_num, fix_sigma=fix_sigma)
+    #     xx = kernels[:batch_size, :batch_size]
+    #     yy = kernels[batch_size:, batch_size:]
+    #     xy = kernels[:batch_size, batch_size:]
+    #     yx = kernels[batch_size:, :batch_size]
+    #     loss = torch.mean(xx + yy - xy - yx)
+    #     loss_all.append(loss)
+    #     return sum(loss_all) / len(loss_all)
+
+
     def gaussian_kernel(self, source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
+        """
+        두 데이터 집합(source, target) 간의 가우시안 커널 값을 계산합니다.
+        MMD Loss 계산에 사용되는 핵심 함수입니다.
+        여러 개의 커널을 혼합하여 사용하는 Multi-kernel 방식을 적용합니다.
+
+        Args:
+            source (torch.Tensor): 첫 번째 분포의 샘플 텐서.
+                                   Shape: (batch_size, feature_dim)
+            target (torch.Tensor): 두 번째 분포의 샘플 텐서.
+                                   Shape: (batch_size, feature_dim)
+            kernel_mul (float): 다양한 대역폭(bandwidth)을 만들기 위한 배수.
+                                기본값은 2.0입니다.
+            kernel_num (int): 사용할 커널의 개수. 기본값은 5입니다.
+            fix_sigma (float, optional): 대역폭(sigma) 값을 고정할 경우 사용.
+                                         None일 경우, 데이터로부터 동적으로 계산됩니다.
+
+        Returns:
+            torch.Tensor: 계산된 가우시안 커널 행렬.
+                          Shape: (2 * batch_size, 2 * batch_size)
+        """
+        # source와 target 텐서를 합쳐 전체 샘플 수를 계산합니다.
         n_samples = int(source.size()[0]) + int(target.size()[0])
+        
+        # 두 텐서를 concat하여 하나의 텐서로 만듭니다.
         total = torch.cat([source, target], dim=0)
-        total0 = total.unsqueeze(0).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
-        total1 = total.unsqueeze(1).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
+
+        # 모든 샘플 쌍 간의 L2 거리의 제곱을 효율적으로 계산합니다.
+        # total.unsqueeze(0) -> (1, n_samples, feature_dim)
+        # total.unsqueeze(1) -> (n_samples, 1, feature_dim)
+        # 브로드캐스팅을 통해 (n_samples, n_samples, feature_dim) 크기의 텐서 2개를 만듭니다.
+        total0 = total.unsqueeze(0).expand(n_samples, n_samples, total.size(1))
+        total1 = total.unsqueeze(1).expand(n_samples, n_samples, total.size(1))
+        # 각 샘플 쌍의 거리 제곱을 계산하고, feature 차원에 대해 합산합니다.
         L2_distance = ((total0 - total1) ** 2).sum(2)
+
+        # 대역폭(bandwidth) 값을 설정합니다.
         if fix_sigma:
             bandwidth = fix_sigma
         else:
+            # 모든 샘플 쌍 간 거리의 평균값을 기반으로 대역폭을 추정합니다.
             bandwidth = torch.sum(L2_distance.data) / (n_samples ** 2 - n_samples)
+
+        # Multi-kernel 방식을 위해 여러 대역폭 값을 생성합니다.
+        # 기본 대역폭 값에 kernel_mul을 거듭제곱하여 곱해줍니다.
         bandwidth /= kernel_mul ** (kernel_num // 2)
         bandwidth_list = [bandwidth * (kernel_mul ** i) for i in range(kernel_num)]
-        kernel_val = [torch.exp(-L2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list]
+
+        # 각 대역폭에 대해 가우시안 커널 값을 계산합니다.
+        # K(x, y) = exp(-||x - y||^2 / (2 * sigma^2))
+        # 여기서 bandwidth는 2 * sigma^2에 해당합니다.
+        kernel_val = [torch.exp(-L2_distance / bw) for bw in bandwidth_list]
+        
+        # 계산된 모든 커널 값을 합산하여 최종 커널 행렬을 반환합니다.
         return sum(kernel_val)
 
 
     def MMD_loss(self, source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
+        """
+        두 분포 간의 최대 평균 불일치(Maximum Mean Discrepancy, MMD) 손실을 계산합니다.
+        MMD는 두 분포가 얼마나 다른지를 측정하는 지표입니다.
+
+        Args:
+            source (torch.Tensor): 첫 번째 분포(e.g., 로컬 정보)의 샘플 텐서.
+                                   Shape: (batch_size, seq_len, feature_dim) 또는 (batch_size, feature_dim)
+            target (torch.Tensor): 두 번째 분포(e.g., 글로벌 정보)의 샘플 텐서.
+                                   Shape: (batch_size, seq_len, feature_dim) 또는 (batch_size, feature_dim)
+            kernel_mul (float): gaussian_kernel 함수로 전달될 인수.
+            kernel_num (int): gaussian_kernel 함수로 전달될 인수.
+            fix_sigma (float, optional): gaussian_kernel 함수로 전달될 인수.
+
+        Returns:
+            torch.Tensor: 계산된 MMD 손실 값 (스칼라 텐서).
+        """
+        # 입력 텐서들을 (batch_size, max_seq_length) 형태로 변환합니다.
         source = source.view(-1, self.max_seq_length)
         target = target.view(-1, self.max_seq_length)
+        
         batch_size = int(source.size()[0])
-        loss_all = []
-        kernels = self.gaussian_kernel(source, target, kernel_mul=kernel_mul, kernel_num=kernel_num, fix_sigma=fix_sigma)
-        xx = kernels[:batch_size, :batch_size]
-        yy = kernels[batch_size:, batch_size:]
-        xy = kernels[:batch_size, batch_size:]
-        yx = kernels[batch_size:, :batch_size]
-        loss = torch.mean(xx + yy - xy - yx)
-        loss_all.append(loss)
-        return sum(loss_all) / len(loss_all)
+        
+        # gaussian_kernel 함수를 호출하여 커널 행렬을 얻습니다.
+        # 이 행렬은 source와 target 샘플 간의 모든 쌍에 대한 커널 값을 포함합니다.
+        kernels = self.gaussian_kernel(source, target,
+                                       kernel_mul=kernel_mul,
+                                       kernel_num=kernel_num,
+                                       fix_sigma=fix_sigma)
 
+        # 커널 행렬을 4개의 부분 행렬로 분할합니다.
+        # XX: source 내부 샘플 간의 커널 값
+        xx = kernels[:batch_size, :batch_size]
+        # YY: target 내부 샘플 간의 커널 값
+        yy = kernels[batch_size:, batch_size:]
+        # XY: source와 target 샘플 간의 커널 값
+        xy = kernels[:batch_size, batch_size:]
+        # YX: target과 source 샘플 간의 커널 값
+        yx = kernels[batch_size:, :batch_size]
+
+        # MMD loss를 계산합니다.
+        # MMD^2 = E[K(x, x')] + E[K(y, y')] - 2 * E[K(x, y)]
+        # 위 식을 샘플 평균으로 근사한 것입니다.
+        loss = torch.mean(xx + yy - xy - yx)
+        
+        # 계산된 손실 값을 반환합니다.
+        # (loss_all 리스트는 현재 코드에서는 불필요해 보이지만 원본 로직을 유지했습니다.)
+        return loss
+    
